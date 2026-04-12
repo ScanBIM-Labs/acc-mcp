@@ -1,0 +1,8 @@
+{
+  "name": "acc-mcp",
+  "version": "1.0.0",
+  "description": "ACC MCP — Issues, RFIs, document search via Autodesk Construction Cloud",
+  "main": "src/index.js",
+  "author": "ScanBIM Labs LLC",
+  "license": "MIT"
+}
