@@ -75,15 +75,123 @@ async function listProjects(token, hubId) {
 }
 
 const TOOLS = [
-  { name: "acc_list_projects", description: "List all ACC/BIM 360 projects you have access to via APS Data Management", inputSchema: { type: "object", properties: {} } },
-  { name: "acc_create_issue", description: "Create a new issue in an ACC project via APS Issues API", inputSchema: { type: "object", properties: { project_id: { type: "string", description: "ACC project ID (b.xxxx format)" }, title: { type: "string" }, description: { type: "string" }, priority: { type: "string", enum: ["critical","high","medium","low"] }, assigned_to: { type: "string" }, due_date: { type: "string" } }, required: ["project_id", "title", "description"] } },
-  { name: "acc_update_issue", description: "Update an existing ACC issue (status, priority, assignee, description)", inputSchema: { type: "object", properties: { project_id: { type: "string" }, issue_id: { type: "string" }, status: { type: "string", enum: ["open","in_review","closed","draft"] }, priority: { type: "string", enum: ["critical","high","medium","low"] }, assigned_to: { type: "string" }, description: { type: "string" } }, required: ["project_id", "issue_id"] } },
-  { name: "acc_list_issues", description: "List and filter issues from an ACC project", inputSchema: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" }, priority: { type: "string" }, assigned_to: { type: "string" } }, required: ["project_id"] } },
-  { name: "acc_create_rfi", description: "Create a new RFI in an ACC project via APS RFIs API", inputSchema: { type: "object", properties: { project_id: { type: "string" }, subject: { type: "string" }, question: { type: "string" }, assigned_to: { type: "string" }, priority: { type: "string", enum: ["critical","high","medium","low"] } }, required: ["project_id", "subject", "question"] } },
-  { name: "acc_list_rfis", description: "List and filter RFIs from an ACC project", inputSchema: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" } }, required: ["project_id"] } },
-  { name: "acc_search_documents", description: "Search drawings, specs, submittals and documents in ACC via APS Data Management", inputSchema: { type: "object", properties: { project_id: { type: "string" }, query: { type: "string" }, document_type: { type: "string" } }, required: ["project_id", "query"] } },
-  { name: "acc_upload_file", description: "Upload a file to an ACC project folder via APS Data Management", inputSchema: { type: "object", properties: { project_id: { type: "string" }, file_url: { type: "string" }, file_name: { type: "string" }, folder_path: { type: "string" } }, required: ["project_id", "file_url", "file_name"] } },
-  { name: "acc_project_summary", description: "Get full ACC project summary including hub, metadata, issue counts, and RFI counts", inputSchema: { type: "object", properties: { project_id: { type: "string" }, hub_id: { type: "string" } }, required: ["project_id"] } }
+  {
+    name: "acc_list_projects",
+    description: "Enumerate every ACC and BIM 360 project the authenticated APS app can see by walking all accessible hubs and their project lists.\n\nWhen to use: The agent needs to discover project IDs before calling any other tool (e.g. the user says 'show me my projects' or 'find issues in the Tower project' and no project_id is known yet). Also useful to confirm hub membership for a project.\n\nWhen NOT to use: Do not call this repeatedly in a loop — cache the result; if the user already supplied a project_id starting with 'b.', skip discovery.\n\nAPS scopes: data:read account:read. No write scope needed.\n\nRate limits: APS default ~50 req/min per app per endpoint; BIM 360 hubs endpoints are pageable (limit 200). This tool fans out 1 hubs call + N project calls (one per hub) so call it sparingly on tenants with many hubs.\n\nErrors: 401 (APS token expired — refresh and retry once); 403 (app not provisioned in the BIM 360/ACC account — ask user to have an account admin add the APS client_id); 404 (rare, indicates hub deleted mid-call); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry with jitter).\n\nSide effects: None. Read-only and idempotent.",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "acc_create_issue",
+    description: "Create a new ACC issue (field observation, coordination clash, safety, quality, etc.) in the target project via the APS Construction Issues API.\n\nWhen to use: The user wants to log a new issue — e.g. 'open a high-priority issue about the leaking valve on level 3' or a downstream agent detected a defect during a model review and needs to record it for the project team.\n\nWhen NOT to use: Do not use to modify an existing issue (use acc_update_issue) and do not use for RFIs (use acc_create_rfi).\n\nAPS scopes: data:read data:write account:read.\n\nRate limits: ACC Issues API limited to ~100 req/min per app; APS default ~50 req/min per endpoint — batch creations with backoff.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks 'Create Issues' permission on the project or scope insufficient — surface to user); 404 (project_id not found — verify the 'b.' prefix and that the project belongs to a hub the app can see via acc_list_projects); 422 (validation — required field like title/description missing or priority enum invalid); 429 (rate limit — retry after 60s); 5xx (ACC upstream — retry with jitter, do not double-create).\n\nSide effects: Creates a persistent issue record visible to all project members. NOT idempotent — a retry on a 5xx may create duplicates; dedupe by title before retrying.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use the 'b.' prefix literal (e.g. 'b.a1b2c3d4-...'). The worker strips the prefix internally for the Issues endpoint. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        title: { type: "string", description: "Short issue title, 1–255 chars. Required.", examples: ["Leaking valve on Level 3 mech room"] },
+        description: { type: "string", description: "Detailed issue description / body. Plain text, up to ~10,000 chars. Required.", examples: ["Observed active drip at VAV-312 supply connection during 2026-04-18 walkthrough. Photos attached in linked RFI."] },
+        priority: { type: "string", enum: ["critical","high","medium","low"], description: "Issue priority. Defaults to 'medium' if omitted.", examples: ["high"] },
+        assigned_to: { type: "string", description: "Optional APS user ID (oxygen ID / ACC user UUID) of the assignee. Leave null for unassigned.", examples: ["ABC123XYZ456"] },
+        due_date: { type: "string", description: "Optional due date in ISO 8601 date format (YYYY-MM-DD).", examples: ["2026-05-01"] }
+      },
+      required: ["project_id", "title", "description"]
+    }
+  },
+  {
+    name: "acc_update_issue",
+    description: "Patch an existing ACC issue — change status, priority, assignee, or description via the APS Construction Issues API.\n\nWhen to use: The user asks to close/reopen/escalate an issue, reassign it, or edit its body. Typical agent flow: acc_list_issues → pick an id → acc_update_issue.\n\nWhen NOT to use: Do not use to create issues (acc_create_issue) or to add comments (not supported by this server).\n\nAPS scopes: data:read data:write account:read.\n\nRate limits: ACC Issues API ~100 req/min per app; APS default ~50 req/min per endpoint.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks edit permission or status transition not allowed by project workflow); 404 (project_id or issue_id not found — verify 'b.' prefix on project_id and that issue_id belongs to that project); 422 (validation — invalid status/priority enum or illegal state transition); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry with jitter).\n\nSide effects: Mutates the issue record. Idempotent when the same body is resent (PATCH semantics) — safe to retry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use the 'b.' prefix literal. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        issue_id: { type: "string", description: "UUID of the issue to update, as returned by acc_list_issues or acc_create_issue.", examples: ["7f3e2a1b-4c5d-6e7f-8a9b-0c1d2e3f4a5b"] },
+        status: { type: "string", enum: ["open","in_review","closed","draft"], description: "New status. Project workflow may forbid certain transitions (e.g. draft → closed).", examples: ["closed"] },
+        priority: { type: "string", enum: ["critical","high","medium","low"], description: "New priority.", examples: ["critical"] },
+        assigned_to: { type: "string", description: "APS user ID of the new assignee. Omit to leave unchanged.", examples: ["ABC123XYZ456"] },
+        description: { type: "string", description: "Replacement description body. Plain text.", examples: ["Root cause confirmed as cracked fitting; scheduling replacement."] }
+      },
+      required: ["project_id", "issue_id"]
+    }
+  },
+  {
+    name: "acc_list_issues",
+    description: "List and filter issues from a single ACC project (limit 50 per call) via the APS Construction Issues API.\n\nWhen to use: The user or upstream agent needs to review open issues, count issues by status/priority, or look up an issue_id before calling acc_update_issue. E.g. 'show me all critical open issues on the Tower project'.\n\nWhen NOT to use: Do not use to fetch RFIs (use acc_list_rfis) or to search documents.\n\nAPS scopes: data:read account:read. No write scope required.\n\nRate limits: ACC Issues API ~100 req/min per app; results pageable (limit 50 here, max 200 upstream). For large projects, call once and filter client-side instead of looping.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks 'View Issues' permission on project or scope insufficient); 404 (project_id not found — verify 'b.' prefix and hub membership via acc_list_projects); 422 (invalid filter value — check status/priority spelling); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry with jitter).\n\nSide effects: None. Read-only and idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        status: { type: "string", description: "Optional status filter. Typical values: open, in_review, closed, draft.", examples: ["open"] },
+        priority: { type: "string", description: "Optional priority filter. Typical values: critical, high, medium, low.", examples: ["critical"] },
+        assigned_to: { type: "string", description: "Optional assignee APS user ID filter. Accepted but not currently forwarded as a URL filter by this server — filter client-side if needed.", examples: ["ABC123XYZ456"] }
+      },
+      required: ["project_id"]
+    }
+  },
+  {
+    name: "acc_create_rfi",
+    description: "Create a new Request For Information (RFI) in an ACC project via the APS Construction RFIs API. RFI is created in 'draft' status — the project workflow owner typically transitions it to 'submitted'.\n\nWhen to use: The user needs a formal question-of-record to the design or GC team — e.g. 'raise an RFI asking for clarification on the Level 2 beam schedule'. RFIs are the auditable channel for clarifications; issues are for field observations.\n\nWhen NOT to use: Do not use for informal observations (use acc_create_issue) or to answer an existing RFI (not supported here).\n\nAPS scopes: data:read data:write account:read.\n\nRate limits: APS default ~50 req/min per endpoint per app. RFIs share the Construction API umbrella with issues (~100 req/min combined).\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks RFI create permission on project); 404 (project_id not found — verify 'b.' prefix and hub membership); 422 (validation — subject/question missing or priority enum invalid); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry with jitter, check for duplicate before retrying).\n\nSide effects: Creates a persistent RFI record. NOT idempotent — retry on 5xx risks duplicates; dedupe by subject before retrying.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        subject: { type: "string", description: "Short RFI subject/title, 1–255 chars. Required.", examples: ["Clarification on Level 2 beam schedule"] },
+        question: { type: "string", description: "Full RFI question body. Plain text, up to ~10,000 chars. Required.", examples: ["Drawing S-201 shows W14x22 but schedule lists W14x26 for gridline C/4. Please confirm which is correct."] },
+        assigned_to: { type: "string", description: "Optional APS user ID of the person the RFI is directed to.", examples: ["ABC123XYZ456"] },
+        priority: { type: "string", enum: ["critical","high","medium","low"], description: "RFI priority. Defaults to 'medium' if omitted.", examples: ["high"] }
+      },
+      required: ["project_id", "subject", "question"]
+    }
+  },
+  {
+    name: "acc_list_rfis",
+    description: "List and filter RFIs from a single ACC project (limit 50 per call) via the APS Construction RFIs API.\n\nWhen to use: The user wants to review open RFIs, count outstanding ones, or look up an RFI ID. E.g. 'how many RFIs are still open on the Tower project?'\n\nWhen NOT to use: Do not use for issues (use acc_list_issues) or document search (use acc_search_documents).\n\nAPS scopes: data:read account:read. No write scope required.\n\nRate limits: APS default ~50 req/min per endpoint; ACC Construction API shared ~100 req/min cap. Pageable (limit 50 here; upstream max 200).\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks RFI view permission); 404 (project_id not found — verify 'b.' prefix and hub membership); 422 (invalid filter value); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry).\n\nSide effects: None. Read-only and idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        status: { type: "string", description: "Optional RFI status filter. Typical values: draft, submitted, open, answered, closed, void.", examples: ["open"] }
+      },
+      required: ["project_id"]
+    }
+  },
+  {
+    name: "acc_search_documents",
+    description: "Full-text search the ACC Docs repository of a project for drawings, specs, submittals, and other files via the APS Data Management search endpoint.\n\nWhen to use: The user wants to find a document by keyword (filename, sheet number, or metadata match). E.g. 'find the latest A-201 sheet' or 'search for mechanical specs on Tower project'.\n\nWhen NOT to use: Do not use to upload a file (use acc_upload_file); do not use to fetch issues/RFIs. If you already have a document URN, fetch it directly with an agent that has Data Management folder/item access.\n\nAPS scopes: data:read account:read. No write scope required.\n\nRate limits: APS Data Management ~50 req/min per app per endpoint; pageable (limit 200 upstream). Avoid tight query loops.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks Docs view permission on the project); 404 (project_id not found — verify 'b.' prefix and hub membership); 422 (invalid filter syntax — simplify query text); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry with jitter).\n\nSide effects: None. Read-only and idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal. The worker re-adds the prefix for Data Management URL formatting. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        query: { type: "string", description: "Free-text search string matched against filenames, titles, and indexed metadata. 1–500 chars.", examples: ["A-201 floor plan"] },
+        document_type: { type: "string", description: "Optional APS document type filter (e.g. 'items:autodesk.bim360:File', 'items:autodesk.bim360:Document').", examples: ["items:autodesk.bim360:Document"] }
+      },
+      required: ["project_id", "query"]
+    }
+  },
+  {
+    name: "acc_upload_file",
+    description: "Upload a file from a public source URL into an ACC project folder. Runs the full four-step APS Data Management flow: top-folder discovery → storage object creation → OSS PUT of bytes → first-version item creation.\n\nWhen to use: The user wants to push a document/photo/model into ACC Docs — e.g. 'upload this site photo to the Tower project Photos folder' or an automation needs to archive an exported report into Project Files.\n\nWhen NOT to use: Do not use for files already in ACC; do not use for files behind auth-gated URLs (fetch step is an unauthenticated GET). For very large files (>100MB), prefer the chunked/signed-S3 upload flow, not this single-PUT implementation.\n\nAPS scopes: data:read data:write data:create account:read.\n\nRate limits: APS Data Management ~50 req/min per endpoint; OSS upload bandwidth typically 100 MB/min per app. This tool issues 3–5 APS calls per upload, so budget accordingly.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks folder write permission — ask account admin to grant 'Edit' on folder); 404 (project_id not found or folder_path does not match any top folder — verify 'b.' prefix, hub membership, and folder name); 422 (invalid file_name or conflicting version); 429 (rate limit — back off 60s); 5xx (ACC/OSS upstream — retry with jitter BUT be cautious: storage object may already be created so reuse, do not re-create). Also: if source file_url returns non-2xx, the tool throws before touching ACC.\n\nSide effects: Creates a storage object, uploads bytes, and creates a versioned item in the target folder. NOT idempotent — a retry may create a duplicate item with a new version. Surface the returned item_id to the user to avoid re-uploads.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal. Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        file_url: { type: "string", description: "Publicly fetchable HTTPS URL of the source file. Must return 2xx to an unauthenticated GET. Max practical size ~100MB for this single-PUT implementation.", examples: ["https://cdn.example.com/photos/site-2026-04-18.jpg"] },
+        file_name: { type: "string", description: "Destination filename in ACC, including extension. 1–255 chars. Avoid path separators.", examples: ["site-2026-04-18.jpg"] },
+        folder_path: { type: "string", description: "Case-insensitive substring of the target top-level folder's display name. Defaults to 'Project Files'. Common values: 'Project Files', 'Plans', 'Photos', 'Submittals'.", examples: ["Photos"] }
+      },
+      required: ["project_id", "file_url", "file_name"]
+    }
+  },
+  {
+    name: "acc_project_summary",
+    description: "Fetch the full ACC project metadata record (name, type, status, dates, extension attributes) for a single project via APS Data Management. If hub_id is omitted the tool picks the first accessible hub, which may be wrong on multi-hub tenants.\n\nWhen to use: The user asks 'tell me about project X' or an agent needs project metadata (start/end dates, type, Forma/BIM 360 flavor) before deciding which downstream tool to call.\n\nWhen NOT to use: Do not use as a cheap existence check — prefer acc_list_projects which returns hub_id with every project and is one call regardless of tenant size.\n\nAPS scopes: data:read account:read. Forma / BIM 360 hubs endpoints only require data:read.\n\nRate limits: APS default ~50 req/min per endpoint; BIM 360 hubs endpoints pageable (limit 200). Cache results for the session.\n\nErrors: 401 (APS token expired — refresh); 403 (user lacks project view or app not in account); 404 (project not in the chosen hub — supply the correct hub_id, or call acc_list_projects first); 422 (malformed project_id — confirm 'b.' prefix); 429 (rate limit — back off 60s); 5xx (ACC upstream — retry).\n\nSide effects: None. Read-only and idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "ACC project ID. MUST use 'b.' prefix literal (this endpoint — unlike Issues/RFIs — wants the prefixed form). Obtain via acc_list_projects.", examples: ["b.a1b2c3d4-1234-5678-9abc-def012345678"] },
+        hub_id: { type: "string", description: "Optional ACC/BIM 360 hub ID. Also uses the 'b.' prefix literal. If omitted, the first hub returned by APS is used — prefer supplying this explicitly on multi-hub tenants to avoid 404s.", examples: ["b.abcdef01-2345-6789-abcd-ef0123456789"] }
+      },
+      required: ["project_id"]
+    }
+  }
 ];
 
 async function handleTool(name, args, env) {
