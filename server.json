@@ -1,0 +1,25 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.scanbimlabs/acc",
+  "description": "Autodesk Construction Cloud: issues, RFIs, sheets, coordination.",
+  "version": "1.0.1",
+  "repository": {
+    "url": "https://github.com/ScanBIM-Labs/acc-mcp",
+    "source": "github"
+  },
+  "homepage": "https://scanbimlabs.io/mcp",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.scanbimlabs.io/acc",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <ScanBIM API key>",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
